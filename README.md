@@ -74,6 +74,17 @@ UTC 时刻与是否逾期（暂停中截止时刻为空，提交后按提交时�
 （一人多票 / 票内重复 / 稿件不属于其分配名单）返回 `422` 与结构化问题清单，不输出
 任何排序结果。
 
+`POST /locate-quotes` 提供**评审引文定位**：评审意见引用稿件原文时，把一组按
+正文顺序排列的引文（原样文本 + 从 0 开始的 Unicode 码位提示起点）定位到**同一篇
+稿件**。服务为每条引文选择一处与引文**逐码位完全一致**（区分大小写、不做归一化）
+的出现位置，整组区间按引文顺序排列且**互不重叠**（前一条结束 ≤ 后一条开始，相邻
+引文允许首尾相接）；在所有完整方案中最小化**起点到提示起点的绝对偏差总和**，总
+偏差相同时取**起点序列字典序最小**的方案。不存在完整方案时返回 `infeasible` 且
+**不泄露任何部分定位**；空引文与越界提示起点（含负数）作为非法输入整体返回 `422`
+结构化问题清单。位置一律按 Unicode 码位计（非 UTF-16/UTF-8 偏移），引文出现位置
+用一次 **Aho–Corasick 多模式扫描**求得，定位用**动态规划 + Pareto 前沿剪枝**
+（相同输入产生逐字节相同的结果）。服务无状态，不持久化稿件原文。
+
 ## 快速启动（单条命令）
 
 ```bash
@@ -95,6 +106,7 @@ curl 直接访问 <http://localhost:8000> 即可（根路径返回服务信息�
 | http://localhost:8000/conflict-audit | 资格审计接口（POST，只读） |
 | http://localhost:8000/review-clock | 评审工时钟重放接口（POST） |
 | http://localhost:8000/decision-ranking | 稿件共识排序接口（POST，Schulze 最强路径） |
+| http://localhost:8000/locate-quotes | 评审引文定位接口（POST，最小绝对偏差 + 字典序） |
 | http://localhost:8000/docs | Swagger 交互式文档 |
 | http://localhost:8000/redoc | ReDoc 文档 |
 
@@ -1221,6 +1233,111 @@ reviewer_id)` 确定性排序，**不输出任何排期**：
 }
 ```
 
+### `POST /locate-quotes`（评审引文定位）
+
+评审意见引用稿件原文时，把一组**按正文顺序排列**的引文定位到**同一篇稿件**。接收：
+
+- `manuscript_id`：稿件 ID（任意非空字符串，无状态原样回显，不查询任何稿件库）；
+- `text`：稿件原文（Unicode 文本，至多 50,000 个码位，允许空字符串）；
+- `quotes`：引文列表（至多 **32** 条，允许重复的引文文本），每条包含：
+  - `text`：引文**原样文本**，必须与正文中某个子串逐 Unicode 码位完全一致
+    （区分大小写、不做 Unicode 归一化；空字符串作为非法输入拒绝）；
+  - `hint_start`：**提示起点**，从 0 开始的 Unicode 码位位置（不是 UTF-16/UTF-8
+    偏移），必须落在 `[0, len(text) - 1]` 内，越界（含负数）作为非法输入拒绝。
+  - 全部引文文本长度之和至多 200,000 个码位。
+
+服务为每条引文选择一处完全一致的出现，要求：
+
+1. 所选区间按引文**顺序排列**；
+2. 区间**互不重叠**（左闭右开 `[start, end)`，前一条 `end <=` 后一条 `start`，
+   相邻引文允许首尾相接）；
+3. 全部引文都必须落位才构成完整方案。
+
+在所有完整方案中最小化 `Σ |start_i − hint_start_i|`（**总绝对偏差**）；总偏差
+相同时，取**起点序列 `[start_0, start_1, …]` 字典序最小**的方案（逐位比较整数，
+第一位能区分即决定，从而确定性地破除「多处等距出现」的同分）。
+
+请求体：
+
+```json
+{
+  "manuscript_id": "m-2026-01",
+  "text": "the quick brown fox jumps over the lazy dog; the fox rests",
+  "quotes": [
+    {"text": "the", "hint_start": 30},
+    {"text": "fox", "hint_start": 48}
+  ]
+}
+```
+
+可行时响应（`200`，`locations` 按 `index` 顺序）：
+
+```json
+{
+  "status": "feasible",
+  "manuscript_id": "m-2026-01",
+  "locations": [
+    {"index": 0, "start": 31, "end": 34},
+    {"index": 1, "start": 49, "end": 52}
+  ],
+  "total_deviation": 2
+}
+```
+
+上例中 `"the"` 出现在 0、31、49，提示 31 附近取 31；`"fox"` 出现在 16、49，
+在不与前一条重叠（起点 ≥ 34）的前提下取 49，总偏差 `|31−30| + |49−48| = 2`。
+`text[start:end]`（Python 码位切片）与引文逐字一致。
+
+无完整方案时（`200`，业务状态为 `infeasible`，**不输出任何部分定位**，即使
+只有最后一条引文落不下）：
+
+```json
+{"status": "infeasible", "manuscript_id": "m-2026-01",
+ "locations": null, "total_deviation": null}
+```
+
+典型不可行情形：引文在正文中没有任何完全一致的出现；或多条引文（如同一条
+长引文出现两次）在顺序、不重叠约束下无法同时落位。
+
+边界约定：
+
+- `quotes` 为空列表时，完整方案就是空方案：
+  `{"status": "feasible", ..., "locations": [], "total_deviation": 0}`；
+- `text` 为空字符串且 `quotes` 非空时，任何提示都越界 → `422`；
+- 引文比正文长、或大小写不同（如正文 `"abc"` 引 `"ABC"`）时正文无出现 →
+  输入本身合法，返回 `infeasible`；
+- 同一引文彼此重叠的出现（如 `"aa"` 在 `"aaa"` 中的起点 0、1）都会被纳入候选，
+  只要最终选择的区间互不重叠即可；
+- 提示起点只是偏好，不是约束：可以把引文定位到离它更远的出现，只要这样能
+  让整组方案的总偏差更小；提示指向的位置甚至不必是该引文的出现；
+- 星面字符（如 `𝕏` U+1F54F）按 **1 个** Unicode 码位计位置。
+
+非法输入整体拒绝（`422`，与请求体字段错误的 FastAPI 校验响应同为 422，但本
+结构为 `errors` 数组），问题按 `(quote_index, type)` 一次性收集，**不输出任何
+定位**：
+
+| 问题类型 | 含义 |
+| --- | --- |
+| `empty_quote` | 引文 `text` 为空字符串（引文须至少含一个码位） |
+| `hint_out_of_range` | `hint_start` 越界：不在 `[0, len(text) - 1]`（含负数） |
+
+同一条引文可同时携带两个问题（空文本且提示越界），两条都返回；一条引文的
+`text` 超过 50,000 码位、引文数超过 32、引文总长超过 200,000 码位等由请求模型
+直接以标准字段校验 `422` 拒绝。
+
+```json
+{
+  "errors": [
+    {
+      "type": "hint_out_of_range",
+      "quote_index": 1,
+      "hint": 99,
+      "detail": "第 1 条引文的提示起点 99 越界：正文长度为 3 个 Unicode 码位，合法起点范围为 0..2"
+    }
+  ]
+}
+```
+
 ### 示例调用
 
 ```bash
@@ -1424,6 +1541,22 @@ curl -s -X POST http://localhost:8000/schedule-discussions \
 # -> status=feasible；schedule = m1->s1（r1 只能 s1）、m2->s2（r3 只能 s2）
 # 无完整方案时 status=infeasible、schedule=null（不输出部分排期）；
 # 超 8 篇/8 时段、重复稿件/时段 ID、评审人未声明可用时段、引用未知时段 -> 422
+
+# 评审引文定位：整组区间有序不重叠，最小化 Σ|起点-提示起点|，同分取起点序列字典序最小
+curl -s -X POST http://localhost:8000/locate-quotes \
+  -H 'Content-Type: application/json' \
+  -d '{
+        "manuscript_id": "m-2026-01",
+        "text": "the quick brown fox jumps over the lazy dog; the fox rests",
+        "quotes": [
+          {"text": "the", "hint_start": 30},
+          {"text": "fox", "hint_start": 48}
+        ]
+      }'
+# -> status=feasible；locations = the@[31,34)、fox@[49,52)（有序不重叠，总偏差 2）；
+#    位置按 Unicode 码位计，text[start:end] 与引文逐字一致
+# 无完整方案（引文无出现 / 多条无法不重叠落位）status=infeasible、locations=null，不泄露部分定位；
+# 空引文、提示起点越界（含负数 / 超出正文长度）-> 422（结构化 errors）
 ```
 
 ## 算法与确定性
@@ -1516,6 +1649,23 @@ curl -s -X POST http://localhost:8000/schedule-discussions \
   非法输入（超 8 篇/8 时段、重复稿件/时段 ID、重复可用时段声明、评审人未声明、
   引用未知时段）一次性收集为按 `(type, manuscript_id, slot_id, reviewer_id)`
   确定性排序的问题清单整体拒绝（422），不输出排期。
+- 评审引文定位（`/locate-quotes`）：全部引文文本（去重后，重复引文共享出现
+  列表）建 **Aho–Corasick** 自动机（Trie + 失败链接，每个状态预聚合在此结束
+  的全部模式），正文从左到右扫描一次，在每位置记录所有命中模式的起点，得到
+  每条引文按起点升序的全部出现（保留彼此重叠的出现），避免逐条 `str.find`
+  在重复正文上反复全串扫描的平方级开销。随后按引文顺序逐层做 **DP + Pareto
+  前沿**：第 i 层状态是该引文的一次落位 `(起点, 父状态, 累计偏差)`，父状态取
+  「结束 ≤ 本起点」的上一层状态——前沿按起点升序、代价单调不降，可行父状态
+  构成前缀，其最后一个同时给出最小代价与最小字典序，双指针 O(1) 摊销取父；
+  起点更小的状态结束更早、对后续更宽松，故按起点升序扫描时只保留「代价严格
+  更小，或代价相同但起点序列字典序更小」的非支配状态（被支配状态不可能出现在
+  任何最优完整方案中）。字典序键编码为 `父状态名次 × (n+1) + 起点` 的单个
+  整数（与 `(父名次, 起点)` 二元组同序），每层末用「同父状态段连续、段内起点
+  升序」按父名次重排赋稠密名次。末层前沿末位即「总偏差最小、同分起点序列字典
+  序最小」的全局最优，沿父指针回溯复原。任一层无可落位状态即 `infeasible`，
+  不输出部分定位；空引文 / 越界提示（非法）在求解前按引文下标收集后整体 422。
+  全程整数运算，无随机性，相同输入（含引文重复、列表固定为正文顺序）产生逐
+  字节相同的结果。
 - 所有节点按 ID 排序后建图，BFS / Dijkstra 均按固定邻接顺序与 (费用, 节点下标) 字典序
   执行，算法无随机性：相同输入（含不同的列表顺序）产生逐字节相同的输出，
   同成本解由 ID 顺序确定性地破除（瓶颈割的节点与边同样按业务 ID 确定排序）。
@@ -1533,13 +1683,14 @@ uvicorn app.main:app --reload --port 8000   # 本地起服务
 
 ```
 app/
-  main.py      # FastAPI 入口：/health、/assign、/assign-coverage、/assign-roles、/conflict-audit、/review-clock、/decision-ranking、/schedule-discussions
+  main.py      # FastAPI 入口：/health、/assign、/assign-coverage、/assign-roles、/conflict-audit、/review-clock、/decision-ranking、/schedule-discussions、/locate-quotes
   models.py    # 请求/响应模型与校验
   solver.py    # 分配求解器：普通模式全局最大流 + 增量模式最小费用最大流 + 负载均衡字典序优化 + 下限覆盖带下界流 + 分角色全局分配
   audit.py     # 资格审计：自稿/显式回避/主题匹配 + 无向合作图最短链（BFS 分层 + 完整 ID 序列字典序破同）
   clock.py     # 工时钟重放：工作日历（工作日 09:00-17:00 UTC、节假日排除）整数秒计时 + 状态机重放与截止时刻投影
   ranking.py   # 共识排序：直接成对支持 + Schulze 最强路径（仅胜者边，Floyd-Warshall 最宽路径）+ 路径强度/ID 破同
   schedule.py  # 讨论时段排期：稿件/时段 ID 排序回溯求字典序最小完整解 + 容量/评审人席位 Hall 剪枝（位掩码子集 DP）+ 带容量 Kuhn
+  quoteloc.py  # 评审引文定位：Aho–Corasick 一次扫描求全部出现 + 按引文顺序的 Pareto 前沿 DP（最小总偏差、同分起点序列字典序最小）
 tests/
   test_assign.py                 # /assign 端到端测试
   test_assign_coverage.py        # /assign-coverage 端到端测试
@@ -1548,6 +1699,7 @@ tests/
   test_review_clock.py          # /review-clock 端到端测试
   test_decision_ranking.py       # /decision-ranking 端到端测试
   test_schedule_discussions.py  # /schedule-discussions 端到端测试
+  test_locate_quotes.py         # /locate-quotes 端到端测试（含对暴力枚举 oracle 的随机对拍）
 Dockerfile
 docker-compose.yml
 requirements.txt

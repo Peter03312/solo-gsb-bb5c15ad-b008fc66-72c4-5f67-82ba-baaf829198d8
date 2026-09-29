@@ -36,6 +36,11 @@ from .models import (
     ManuscriptAuditOut,
     ManuscriptRolesOut,
     PairSupportOut,
+    QuoteLocationError,
+    QuoteLocationRequest,
+    QuoteLocationResponse,
+    QuoteLocationIssueOut,
+    QuoteSpanOut,
     ReviewClockError,
     ReviewClockPairOut,
     ReviewClockRequest,
@@ -53,6 +58,7 @@ from .models import (
     WorkloadBalanceOut,
 )
 from .audit import audit_conflicts
+from .quoteloc import Quote as QuoteSpec, locate_quotes
 from .ranking import RankingBallot, schulze_rank
 from .schedule import (
     DiscussionAssignment,
@@ -71,7 +77,7 @@ from .solver import (
 
 app = FastAPI(
     title="Anonymous Review Assignment API",
-    version="1.10.0",
+    version="1.11.0",
     description=(
         "匿名评审分配服务：基于全局最大流（非逐稿贪心）求满足主题能力、"
         "利益冲突与容量约束的完整分配；不可行时返回缺口诊断与全局最小割证明"
@@ -111,6 +117,11 @@ app = FastAPI(
         "容量，在每稿全体评审人共同可出席、同一评审人同时段只讨论一稿、时段容量"
         "不超出的全局约束下求完整排期；多方案按稿件 ID 顺序逐位比较时段 ID 取字典序"
         "最小者，无完整方案时返回 infeasible 且不输出部分排期，非法输入整体 422。"
+        "支持评审引文定位（POST /locate-quotes）：输入一篇稿件原文与一组按正文顺序"
+        "排列的引文（原样文本 + 从 0 开始的 Unicode 码位提示起点），为每条引文选择"
+        "一处完全一致的出现，整组区间按引文顺序且互不重叠；在所有完整方案中最小化"
+        "起点到提示起点的绝对偏差总和，同分时取起点序列字典序最小者；无完整方案时"
+        "返回 infeasible 且不泄露部分定位，空引文或越界提示起点整体 422。"
         "服务无状态，不持久化任何稿件/评审信息。"
     ),
 )
@@ -640,3 +651,52 @@ def schedule_discussions(req: DiscussionScheduleRequest):
 
     # 输入合法但无完整方案：不输出部分排期
     return DiscussionScheduleResponse(status="infeasible", schedule=None)
+
+
+@app.post(
+    "/locate-quotes",
+    response_model=QuoteLocationResponse,
+    tags=["quote-location"],
+    responses={422: {"model": QuoteLocationError}},
+)
+def locate_quotes_endpoint(req: QuoteLocationRequest):
+    quotes = [
+        QuoteSpec(text=q.text, hint_start=q.hint_start) for q in req.quotes
+    ]
+
+    result = locate_quotes(req.manuscript_id, req.text, quotes)
+    if result.issues:
+        # 空引文 / 越界提示起点：整体拒绝，不输出任何定位
+        return JSONResponse(
+            status_code=422,
+            content=QuoteLocationError(
+                errors=[
+                    QuoteLocationIssueOut(
+                        type=i.type,
+                        quote_index=i.quote_index,
+                        hint=i.hint,
+                        detail=i.detail,
+                    )
+                    for i in result.issues
+                ]
+            ).model_dump(mode="json"),
+        )
+
+    if result.feasible:
+        return QuoteLocationResponse(
+            status="feasible",
+            manuscript_id=req.manuscript_id,
+            locations=[
+                QuoteSpanOut(index=span.index, start=span.start, end=span.end)
+                for span in result.locations
+            ],
+            total_deviation=result.total_deviation,
+        )
+
+    # 输入合法但无完整方案：不输出部分定位
+    return QuoteLocationResponse(
+        status="infeasible",
+        manuscript_id=req.manuscript_id,
+        locations=None,
+        total_deviation=None,
+    )

@@ -806,3 +806,101 @@ class DiscussionScheduleError(BaseModel):
     """请求被拒绝（422）：结构化问题清单，不输出任何排期。"""
 
     errors: list[ScheduleIssueOut]
+
+
+# ---------- POST /locate-quotes：评审引文定位 ----------
+
+# 数量 / 长度上限与 app.quoteloc 中的求解器常量保持一致
+_MAX_LOCATE_TEXT_LEN = 50_000
+_MAX_LOCATE_QUOTES = 32
+_MAX_LOCATE_QUOTE_CHARS_TOTAL = 200_000
+
+
+class QuoteIn(BaseModel):
+    """一条按正文顺序给出的引文及其提示起点。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    text: str = Field(
+        max_length=_MAX_LOCATE_TEXT_LEN,
+        description=(
+            "引文原样文本：必须与稿件正文中的某个子串逐 Unicode 码位完全一致"
+            "（区分大小写、不做归一化）；空字符串作为非法输入返回结构化 422"
+            "（empty_quote），而非通用字段校验错误"
+        ),
+    )
+    hint_start: int = Field(
+        description=(
+            "提示起点（从 0 开始的 Unicode 码位位置，不是 UTF-16/UTF-8 偏移）；"
+            "必须落在 [0, 正文长度 - 1] 内，越界（含负数）作为非法输入拒绝"
+        ),
+    )
+
+
+class QuoteLocationRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    manuscript_id: str = Field(min_length=1, max_length=128, description="稿件 ID（原样回显）")
+    text: str = Field(
+        max_length=_MAX_LOCATE_TEXT_LEN,
+        description=(
+            "稿件原文（Unicode 文本）；服务无状态，不持久化该文本，仅用于本次定位。"
+            "允许为空字符串：配合空引文列表是可行空方案；配合非空引文时任何提示"
+            "起点都越界，按非法输入返回结构化 422"
+        ),
+    )
+    quotes: list[QuoteIn] = Field(
+        max_length=_MAX_LOCATE_QUOTES,
+        description=(
+            "按正文顺序排列的引文列表（至多 32 条）；允许重复的引文文本。"
+            "空列表的完整方案为空，total_deviation 为 0"
+        ),
+    )
+
+    @model_validator(mode="after")
+    def _check_quote_chars_total(self) -> "QuoteLocationRequest":
+        total = sum(len(q.text) for q in self.quotes)
+        if total > _MAX_LOCATE_QUOTE_CHARS_TOTAL:
+            raise ValueError(
+                f"引文文本总长度 {total} 超出上限 "
+                f"{_MAX_LOCATE_QUOTE_CHARS_TOTAL} 个 Unicode 码位"
+            )
+        return self
+
+
+class QuoteSpanOut(BaseModel):
+    """一条引文的定位区间：左闭右开 [start, end)（Unicode 码位）。"""
+
+    index: int = Field(description="引文在请求 quotes 列表中的下标（从 0 开始）")
+    start: int = Field(description="区间起点（含）：text[start:end] 与引文完全一致")
+    end: int = Field(description="区间终点（不含）：end - start 等于引文长度")
+
+
+class QuoteLocationResponse(BaseModel):
+    # feasible 时给出每条引文的完整定位（按 index 顺序）；
+    # infeasible 时为 null（不输出任何部分定位）
+    status: Literal["feasible", "infeasible"]
+    manuscript_id: str
+    # 可行时各区间按引文顺序排列且互不重叠（前一条 end <= 后一条 start）
+    locations: list[QuoteSpanOut] | None
+    # 可行时为 Σ |start - hint_start|；不可行时为 null
+    total_deviation: int | None
+
+
+QuoteLocationIssueType = Literal["empty_quote", "hint_out_of_range"]
+
+
+class QuoteLocationIssueOut(BaseModel):
+    """一条非法输入原因（整体 422 时返回全部问题，不输出任何定位）。"""
+
+    type: QuoteLocationIssueType
+    quote_index: int = Field(description="问题引文在 quotes 列表中的下标（从 0 开始）")
+    # hint_out_of_range 时为越界的提示起点；empty_quote 时为 null
+    hint: int | None = None
+    detail: str
+
+
+class QuoteLocationError(BaseModel):
+    """请求被拒绝（422）：结构化问题清单，不输出任何定位。"""
+
+    errors: list[QuoteLocationIssueOut]
