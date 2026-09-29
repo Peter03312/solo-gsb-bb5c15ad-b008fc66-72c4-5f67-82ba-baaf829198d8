@@ -806,3 +806,85 @@ class DiscussionScheduleError(BaseModel):
     """请求被拒绝（422）：结构化问题清单，不输出任何排期。"""
 
     errors: list[ScheduleIssueOut]
+
+
+# ---------- POST /locate-quotes：评审引文定位 ----------
+
+
+class QuoteIn(BaseModel):
+    """一条评审引文：原样文本与提示起点。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    text: str = Field(
+        max_length=50000,
+        description=(
+            "引文原样文本（必须与稿件正文逐字符完全一致）；空字符串作为非法输入"
+            "拒绝（empty_quote，整体 422 并返回结构化问题清单）"
+        ),
+    )
+    hint_start: int = Field(
+        description=(
+            "提示起点（从 0 开始的 Unicode 字符位置）；合法范围 0..len(正文)，"
+            "越界作为非法输入拒绝（hint_out_of_bounds，整体 422）"
+        ),
+    )
+
+
+class QuoteLocationRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    manuscript_id: str = Field(min_length=1, max_length=128, description="稿件 ID")
+    text: str = Field(
+        max_length=50000,
+        description=(
+            "稿件原文（按 Unicode 码点计数；字符位置均为该字符串的下标，"
+            "起点含端点、终点排他）；可为空字符串（此时任何非空引文均不可行）"
+        ),
+    )
+    quotes: list[QuoteIn] = Field(
+        max_length=100,
+        description=(
+            "按正文顺序排列的引文组（至多 100 条）：每条给出完全一致的原样文本"
+            "与提示起点；整组位置须按引文顺序且互不重叠。允许空列表（完整方案"
+            "为空、偏差总和为 0）"
+        ),
+    )
+
+
+QuoteLocationIssueType = Literal["empty_quote", "hint_out_of_bounds"]
+
+
+class QuoteLocationIssueOut(BaseModel):
+    """一条非法输入原因（整体 422 时返回全部问题，不输出任何定位）。"""
+
+    type: QuoteLocationIssueType
+    # 问题引文在 quotes 列表中的下标
+    index: int
+    detail: str
+
+
+class QuoteLocationError(BaseModel):
+    """请求被拒绝（422）：结构化问题清单，不输出任何定位结果。"""
+
+    errors: list[QuoteLocationIssueOut]
+
+
+class QuotePlacementOut(BaseModel):
+    """一条引文的定位结果（占据原文 [start, end) 字符区间）。"""
+
+    index: int = Field(description="引文在 quotes 列表中的下标（从 0 开始）")
+    start: int = Field(description="定位起点（含端点，Unicode 字符位置）")
+    end: int = Field(
+        description="定位终点（排他端点）；end - start 等于引文字符数",
+    )
+    deviation: int = Field(description="|start - hint_start|")
+
+
+class QuoteLocationResponse(BaseModel):
+    manuscript_id: str
+    # feasible 时给出完整定位（按引文顺序）；infeasible 时为 null（不输出部分定位）
+    status: Literal["feasible", "infeasible"]
+    placements: list[QuotePlacementOut] | None
+    # 可行时为各引文 |起点 - 提示起点| 之和；不可行时为 null
+    total_deviation: int | None

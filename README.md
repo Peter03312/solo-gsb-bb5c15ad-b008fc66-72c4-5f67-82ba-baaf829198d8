@@ -74,6 +74,20 @@ UTC 时刻与是否逾期（暂停中截止时刻为空，提交后按提交时�
 （一人多票 / 票内重复 / 稿件不属于其分配名单）返回 `422` 与结构化问题清单，不输出
 任何排序结果。
 
+`POST /schedule-discussions` 提供**讨论时段排期**：接收 `/assign` 可行结果中
+至多 8 篇稿件与评审人名单、至多 8 个候选时段、各评审人可出席时段与各时段
+容量，在每稿全体评审人共同可出席、同一评审人同时段只讨论一稿、时段容量
+不超出的全局约束下求完整排期；多方案按稿件 ID 顺序逐位比较时段 ID 取字典序
+最小者，无完整方案时返回 infeasible 且不输出部分排期，非法输入整体 422。
+
+`POST /locate-quotes` 提供**评审引文定位**：输入稿件 ID、原文与一组按正文
+顺序排列的引文（每条给出原样文本与从 0 开始的 Unicode 字符提示起点），
+为每条引文在同一篇稿件正文中选择一个**逐字符完全一致**的出现位置，整组位置
+按引文顺序且互不重叠；在所有完整方案中最小化各起点到提示起点的绝对偏差总和，
+同分时取起点序列字典序最小的方案。任一条引文无完全一致出现、或顺序 / 不重叠
+约束下不存在完整方案时返回 `infeasible` 且**不泄露任何部分定位**；空引文与
+越界提示位置作为非法输入整体 `422`。
+
 ## 快速启动（单条命令）
 
 ```bash
@@ -95,6 +109,8 @@ curl 直接访问 <http://localhost:8000> 即可（根路径返回服务信息�
 | http://localhost:8000/conflict-audit | 资格审计接口（POST，只读） |
 | http://localhost:8000/review-clock | 评审工时钟重放接口（POST） |
 | http://localhost:8000/decision-ranking | 稿件共识排序接口（POST，Schulze 最强路径） |
+| http://localhost:8000/schedule-discussions | 讨论时段排期接口（POST） |
+| http://localhost:8000/locate-quotes | 评审引文定位接口（POST，偏差最小 + 字典序破同） |
 | http://localhost:8000/docs | Swagger 交互式文档 |
 | http://localhost:8000/redoc | ReDoc 文档 |
 
@@ -1221,6 +1237,114 @@ reviewer_id)` 确定性排序，**不输出任何排期**：
 }
 ```
 
+### `POST /locate-quotes`（评审引文定位）
+
+评审意见引用稿件原文时，把**一组按正文顺序排列的引文**整体定位到**同一篇
+稿件**。接收：
+
+- `manuscript_id`：稿件 ID（仅随响应回显，服务无状态、不校验稿件库）；
+- `text`：稿件原文（至多 50,000 字符；字符位置一律按 **Unicode 码点**
+  计数，从 0 开始，起点含端点、终点排他）；
+- `quotes`：引文列表（至多 100 条，按正文顺序给出），每条包含
+  - `text`：引文的**原样文本**（非空，至多 50,000 字符），必须与原文
+    **逐字符完全一致**才算出现（不做大小写折叠、空白归一或模糊匹配）；
+  - `hint_start`：提示起点，合法范围 `0..len(text)`（`len(text)` 为
+    文末边界）。
+
+为每条引文在原文中选择一个完全一致出现的起点 `s_i`，整组位置满足：
+
+1. **按引文顺序**：`s_0 < s_1 < ...` 由下面的不重叠条件隐含；
+2. **互不重叠**：`s_{i+1} >= s_i + len(quote_i)`（后一条起点不早于前一条
+   排他终点，端点相接允许，例如两条引文分别为 `[0,2)` 与 `[2,4)`）。
+
+在**所有完整方案**中：
+
+- 先最小化**绝对偏差总和** `Σ |s_i - hint_start_i|`；
+- 偏差总和相同时，取**起点序列 `(s_0, s_1, ...)` 字典序最小**的方案
+  （自第一条引文起，每条都在不抬高后续最优代价的前提下取最小可行起点）。
+
+求解不是各条引文独立就近贪心：每条引文的占位都会收紧后续引文的不重叠
+边界，服务用按引文顺序的后缀动态规划，在全局完整方案空间中取最优；输入
+列表的任何等价重排（在本接口中即提示起点与文本的对应关系不变）以及重复
+引文本都产生确定结果。
+
+请求体：
+
+```json
+{
+  "manuscript_id": "m-2026-01",
+  "text": "ababa",
+  "quotes": [
+    {"text": "aba", "hint_start": 0},
+    {"text": "ba", "hint_start": 4}
+  ]
+}
+```
+
+可行时响应（`200`，`placements` 顺序与 `quotes` 一致）：
+
+```json
+{
+  "manuscript_id": "m-2026-01",
+  "status": "feasible",
+  "placements": [
+    {"index": 0, "start": 0, "end": 3, "deviation": 0},
+    {"index": 1, "start": 3, "end": 5, "deviation": 1}
+  ],
+  "total_deviation": 1
+}
+```
+
+上例中 `"aba"` 出现于 0、2，`"ba"` 出现于 1、3；第一条占 `[0,3)` 后
+第二条只能取 3（偏差 1），而第一条取 2 会与第二条的任何出现重叠，故
+`(0,3)` 是唯一完整方案。`end - start` 恒等于引文字符数，`deviation` 为
+该条 `|start - hint_start|`，`total_deviation` 为各条偏差之和。
+
+同分破同的简单例子：原文 `"aaa"`、两条引文均为 `"a"` 且提示起点均为 1 时，
+方案 `(0,1)` 与 `(1,2)` 的偏差总和都是 1，服务返回字典序更小的 `(0,1)`。
+
+不存在完整方案时（`200`，业务状态为 `infeasible`）**只回状态、不泄露任何
+部分定位**（即使只有最后一条引文无法落位，前 n-1 条的位置也不出现在响应中）：
+
+```json
+{"manuscript_id": "m-2026-01", "status": "infeasible", "placements": null, "total_deviation": null}
+```
+
+判定不可行的两类情形（输入本身合法）：
+
+- 某条引文在原文中没有任何逐字符完全一致的出现（如原文 `"abc"` 中找
+  `"xyz"`；空原文配非空引文同理）；
+- 全部引文都能出现，但不存在满足「按顺序 + 互不重叠」的完整组合
+  （例如原文 `"aaa"` 中定位两条 `"aa"`：出现位置 0、1 必然互相重叠）。
+
+边界约定：
+
+- `quotes` 为空列表时，完整方案就是空方案：
+  `{"status": "feasible", "placements": [], "total_deviation": 0}`；
+- `hint_start == len(text)` 合法（提示落在文末边界），实际起点仍只能取
+  真实出现位置，偏差照常计入；
+- 同一原文片段可被多条引文引用：出现位置枚举结果共用，且它们仍须满足
+  彼此不重叠（两条相同引文必须落向不同出现）；
+- 含中文、emoji（含代理对字符）等的原文按字符位置处理，例如
+  `"a😀b"` 中第二个 emoji 的位置是 1、`b` 的位置是 3。
+
+非法输入整体拒绝（`422`，结构为 `errors` 数组），同一请求中的全部问题
+一次性收集并按 `(type, index)` 确定性排序，**不输出任何定位**：
+
+| 问题类型 | 含义 |
+| --- | --- |
+| `empty_quote` | 引文 `text` 为空字符串（引文必须是非空原文片段） |
+| `hint_out_of_bounds` | 提示起点超出 `0..len(text)`（负数或大于原文长度） |
+
+```json
+{
+  "errors": [
+    {"type": "empty_quote", "index": 0, "detail": "第 0 条引文的 text 为空字符串，引文必须是非空原文片段"},
+    {"type": "hint_out_of_bounds", "index": 2, "detail": "第 2 条引文的 hint_start=99 越界：正文长度为 3 个字符，合法范围为 0..3"}
+  ]
+}
+```
+
 ### 示例调用
 
 ```bash
@@ -1424,6 +1548,23 @@ curl -s -X POST http://localhost:8000/schedule-discussions \
 # -> status=feasible；schedule = m1->s1（r1 只能 s1）、m2->s2（r3 只能 s2）
 # 无完整方案时 status=infeasible、schedule=null（不输出部分排期）；
 # 超 8 篇/8 时段、重复稿件/时段 ID、评审人未声明可用时段、引用未知时段 -> 422
+
+# 评审引文定位：逐字符完全一致出现，按顺序互不重叠，偏差总和最小、同分取起点序列字典序最小
+curl -s -X POST http://localhost:8000/locate-quotes \
+  -H 'Content-Type: application/json' \
+  -d '{
+        "manuscript_id": "m-2026-01",
+        "text": "ababa",
+        "quotes": [
+          {"text": "aba", "hint_start": 0},
+          {"text": "ba", "hint_start": 4}
+        ]
+      }'
+# -> status=feasible；placements = [0,3) 偏差 0、[3,5) 偏差 1；total_deviation=1
+# 原文 "aaa"、两条 "a" 提示均为 1 时，(0,1) 与 (1,2) 同分，取字典序更小的 (0,1)
+# 任一条引文无完全一致出现、或无满足顺序/不重叠的完整组合 -> status=infeasible，
+# placements=null 且 total_deviation=null（不泄露任何部分定位）
+# 空引文 text=""、hint_start 超出 0..len(text) -> 422（结构化 errors 清单）
 ```
 
 ## 算法与确定性
@@ -1516,6 +1657,19 @@ curl -s -X POST http://localhost:8000/schedule-discussions \
   非法输入（超 8 篇/8 时段、重复稿件/时段 ID、重复可用时段声明、评审人未声明、
   引用未知时段）一次性收集为按 `(type, manuscript_id, slot_id, reviewer_id)`
   确定性排序的问题清单整体拒绝（422），不输出排期。
+- 评审引文定位（`/locate-quotes`）：先一次性收集全部非法输入（空引文、提示
+  起点越界，按 `(type, index)` 排序后整体 422，不输出任何定位）。出现位置
+  枚举在 C 层 `str.find` 上进行（相同引文文本只枚举一次、结果共用），出现数
+  超过与正文 / 引文长度相关的保护阈值时回退线性时间 KMP，规避长模式在周期
+  文本中反复 `find` 的近平方退化。求解是按引文顺序的稀疏后缀动态规划：
+  第 i 层在该引文的出现下标上保存后缀最小代价
+  `suffmin_i[k] = min(|s_j-hint_i| + suff_{i+1}(s_j+len_i) : j >= k)`，
+  对下一层的边界点查用随扫描方向单调移动的归并指针线性完成（无需长度 L 的
+  稠密层）；首项代价为无穷即无完整方案（返回 `infeasible`，不输出任何部分
+  定位）。最优值确定后正向贪心重构：每条引文在「不抬高后缀最优代价」的出现
+  中取起点最小者——前缀固定、后缀取最优时当前起点越小字典序越小，故所得
+  起点序列为同分下的字典序最小方案。位置均为 Unicode 码点下标，全程整数
+  运算且无随机性，相同请求逐字节产生相同响应；服务无状态，不持久化原文。
 - 所有节点按 ID 排序后建图，BFS / Dijkstra 均按固定邻接顺序与 (费用, 节点下标) 字典序
   执行，算法无随机性：相同输入（含不同的列表顺序）产生逐字节相同的输出，
   同成本解由 ID 顺序确定性地破除（瓶颈割的节点与边同样按业务 ID 确定排序）。
@@ -1533,13 +1687,14 @@ uvicorn app.main:app --reload --port 8000   # 本地起服务
 
 ```
 app/
-  main.py      # FastAPI 入口：/health、/assign、/assign-coverage、/assign-roles、/conflict-audit、/review-clock、/decision-ranking、/schedule-discussions
+  main.py      # FastAPI 入口：/health、/assign、/assign-coverage、/assign-roles、/conflict-audit、/review-clock、/decision-ranking、/schedule-discussions、/locate-quotes
   models.py    # 请求/响应模型与校验
   solver.py    # 分配求解器：普通模式全局最大流 + 增量模式最小费用最大流 + 负载均衡字典序优化 + 下限覆盖带下界流 + 分角色全局分配
   audit.py     # 资格审计：自稿/显式回避/主题匹配 + 无向合作图最短链（BFS 分层 + 完整 ID 序列字典序破同）
   clock.py     # 工时钟重放：工作日历（工作日 09:00-17:00 UTC、节假日排除）整数秒计时 + 状态机重放与截止时刻投影
   ranking.py   # 共识排序：直接成对支持 + Schulze 最强路径（仅胜者边，Floyd-Warshall 最宽路径）+ 路径强度/ID 破同
   schedule.py  # 讨论时段排期：稿件/时段 ID 排序回溯求字典序最小完整解 + 容量/评审人席位 Hall 剪枝（位掩码子集 DP）+ 带容量 Kuhn
+  locate.py    # 评审引文定位：完全一致出现枚举（str.find + KMP 回退）+ 稀疏后缀 DP 最小化偏差总和 + 字典序最小起点序列重构
 tests/
   test_assign.py                 # /assign 端到端测试
   test_assign_coverage.py        # /assign-coverage 端到端测试
@@ -1548,6 +1703,7 @@ tests/
   test_review_clock.py          # /review-clock 端到端测试
   test_decision_ranking.py       # /decision-ranking 端到端测试
   test_schedule_discussions.py  # /schedule-discussions 端到端测试
+  test_locate_quotes.py          # /locate-quotes 端到端测试
 Dockerfile
 docker-compose.yml
 requirements.txt
